@@ -4,10 +4,11 @@ API Provider : GoBoard (goboardapi.azurewebsites.net)
 Response Format: XML (ArrayOfCountLocationResponseModel)
 Schedule      : Hourly via GitHub Actions (collect.yml)
 
-Confirmed XML fields (from live API response):
-  FacilityId, FacilityName, LocationId, LocationName,
-  IsClosed, LastCount, TotalCapacity, PercetageCapacity,
-  LastUpdatedDateAndTime
+Behaviour:
+  - Fetches live occupancy counts from the GoBoard API
+  - Skips writing rows if the sensor timestamp has not changed since last scrape
+  - Appends only genuinely new readings to data/occupancy.csv
+  - Preserves both scrape timestamp and sensor timestamp for research transparency
 """
 
 import csv
@@ -79,10 +80,10 @@ def parse_xml(xml_text: str) -> list[dict]:
             )
             return "" if nil == "true" else (el.text or "").strip()
 
-        last_count    = int(get("LastCount") or 0)
-        total_cap     = int(get("TotalCapacity") or 0)
+        last_count = int(get("LastCount") or 0)
+        total_cap  = int(get("TotalCapacity") or 0)
 
-        # PercetageCapacity in the API is always 0; compute it correctly here
+        # PercetageCapacity in the API is always 0; compute correctly here
         occupancy_pct = (
             round(last_count / total_cap * 100, 1) if total_cap > 0 else 0.0
         )
@@ -92,7 +93,7 @@ def parse_xml(xml_text: str) -> list[dict]:
             "facility_name":    get("FacilityName"),
             "location_id":      get("LocationId"),
             "location_name":    get("LocationName"),
-            "is_closed":        get("IsClosed"),          # "true" / "false"
+            "is_closed":        get("IsClosed"),
             "last_count":       last_count,
             "total_capacity":   total_cap,
             "occupancy_pct":    occupancy_pct,
@@ -102,6 +103,22 @@ def parse_xml(xml_text: str) -> list[dict]:
     return rows
 
 
+def get_last_recorded_timestamps() -> dict:
+    """
+    Read the CSV and return a dict of {location_id: last_updated_api}
+    so we can compare against the new API response and skip duplicates.
+    """
+    if not os.path.exists(DATA_FILE):
+        return {}
+
+    last_seen = {}
+    with open(DATA_FILE, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            last_seen[row["location_id"]] = row["last_updated_api"]
+    return last_seen
+
+
 def ensure_csv_exists():
     os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
     if not os.path.exists(DATA_FILE):
@@ -109,14 +126,30 @@ def ensure_csv_exists():
             csv.DictWriter(f, fieldnames=FIELDNAMES).writeheader()
 
 
-def append_rows(rows: list[dict]):
+def append_rows(rows: list[dict], last_seen: dict):
     now_local = datetime.now(ZoneInfo(TIMEZONE))
     now_utc   = now_local.astimezone(ZoneInfo("UTC"))
     ensure_csv_exists()
 
+    new_rows = []
+    for row in rows:
+        loc_id      = str(row["location_id"])
+        api_updated = row["last_updated_api"]
+
+        # Only save if this location has a genuinely new sensor reading
+        if last_seen.get(loc_id) == api_updated:
+            print(f"[SKIP] {row['location_name']} — no new data since {api_updated}")
+            continue
+
+        new_rows.append(row)
+
+    if not new_rows:
+        print("[OK] No new data across any location. Nothing written.")
+        return
+
     with open(DATA_FILE, "a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
-        for row in rows:
+        for row in new_rows:
             writer.writerow({
                 "timestamp_local":  now_local.isoformat(timespec="seconds"),
                 "timestamp_utc":    now_utc.isoformat(timespec="seconds"),
@@ -133,15 +166,16 @@ def append_rows(rows: list[dict]):
             })
 
     print(
-        f"[OK] {len(rows)} locations saved at "
+        f"[OK] {len(new_rows)} new rows saved at "
         f"{now_local.isoformat(timespec='seconds')} (local)."
     )
 
 
 def main():
-    xml_text = fetch_xml()
-    rows     = parse_xml(xml_text)
-    append_rows(rows)
+    xml_text  = fetch_xml()
+    rows      = parse_xml(xml_text)
+    last_seen = get_last_recorded_timestamps()
+    append_rows(rows, last_seen)
 
 
 if __name__ == "__main__":
